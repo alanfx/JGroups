@@ -502,7 +502,7 @@ public class ENCRYPT extends Protocol {
                             if(tmpMsg != null)
                                 batch.replace(msg, tmpMsg);
                             else
-                                log.warn("Unrecognised cipher discarding message");
+                                log.warn("unrecognised cipher; discarding message");
                         }
                         catch(Exception e) {
                             log.error("failed decrypting message", e);
@@ -905,15 +905,13 @@ public class ENCRYPT extends Protocol {
                 Message msg=(Message)evt.getArg();
                 try {
                     if(queue_down) {
-                        if(log.isTraceEnabled())
-                            log.trace("queueing down message as no session key established" + msg);
+                        log.trace("queueing down message as no session key established" + msg);
                         downMessageQueue.put(msg); // queue messages if we are waiting for a new key
                     }
                     else {
                         // make sure the down queue is drained first to keep ordering
-                        if(!suppliedKey) {
+                        if(!suppliedKey)
                             drainDownQueue();
-                        }
                         sendDown(msg);
                     }
 
@@ -925,8 +923,7 @@ public class ENCRYPT extends Protocol {
 
             case Event.VIEW_CHANGE:
                 View view=(View)evt.getArg();
-                if(log.isDebugEnabled())
-                    log.debug("new view: " + view);
+                log.debug("new view: " + view);
                 if(!suppliedKey) {
                     handleViewChange(view, false);
                 }
@@ -934,8 +931,7 @@ public class ENCRYPT extends Protocol {
 
             case Event.SET_LOCAL_ADDRESS:
                 local_addr=(Address)evt.getArg();
-                if(log.isDebugEnabled())
-                    log.debug("set local address to " + local_addr);
+                log.debug("set local address to " + local_addr);
                 break;
 
             case Event.TMP_VIEW:
@@ -974,10 +970,7 @@ public class ENCRYPT extends Protocol {
         }
     }
 
-    /**
-     * @param msg
-     * @throws Exception
-     */
+
     private void sendDown(Message msg) throws Exception {
         if(msg.getLength() == 0 && !encrypt_entire_message) {
             passItDown(new Event(Event.MSG, msg));
