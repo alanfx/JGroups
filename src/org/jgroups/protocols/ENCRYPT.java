@@ -101,7 +101,7 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 @MBean(description="Protocol which encrypts and decrypts cluster traffic")
 public class ENCRYPT extends Protocol {
-    Observer observer;
+    protected Observer observer;
 
     interface Observer {
         void up(Event evt);
@@ -179,9 +179,9 @@ public class ENCRYPT extends Protocol {
     protected final Lock decrypt_lock=new ReentrantLock();
 
     // version filed for secret key
-    private String symVersion=null;
+    private String symVersion;
     // dhared secret key to encrypt/decrypt messages
-    SecretKey secretKey=null;
+    SecretKey secretKey;
 
     // map to hold previous keys so we can decrypt some earlier messages if we need to
     final Map<String,Cipher> keyMap=new WeakHashMap<String,Cipher>();
@@ -468,7 +468,7 @@ public class ENCRYPT extends Protocol {
             switch(hdr.getType()) {
                 case EncryptHeader.ENCRYPT:
                     // if msg buffer is empty, and we didn't encrypt the entire message, just pass up
-                    if(!hdr.encrypt_entire_msg && msg.getLength() == 0)
+                    if(!hdr.encryptEntireMessage() && msg.getLength() == 0)
                         break;
 
                     // if queueing then pass into queue to be dealt with later
@@ -647,7 +647,7 @@ public class ENCRYPT extends Protocol {
 
     protected void handleEncryptedMessage(Message msg, Event evt, EncryptHeader hdr) throws Exception {
         // if msg buffer is empty, and we didn't encrypt the entire message, just pass up
-        if(!hdr.encrypt_entire_msg && msg.getLength() == 0) {
+        if(!hdr.encryptEntireMessage() && msg.getLength() == 0) {
             if(log.isTraceEnabled())
                 log.trace("passing up message as it has an empty buffer ");
             passItUp(evt);
@@ -806,14 +806,14 @@ public class ENCRYPT extends Protocol {
             else {
                 if(log.isTraceEnabled())
                     log.trace("decrypting using previous cipher version " + hdr.getVersion());
-                return _decrypt(cipher, msg, hdr.encrypt_entire_msg);
+                return _decrypt(cipher, msg, hdr.encryptEntireMessage());
             }
         }
 
         else {
 
             // reset buffer with decrypted message
-            return _decrypt(cipher, msg, hdr.encrypt_entire_msg);
+            return _decrypt(cipher, msg, hdr.encryptEntireMessage());
         }
     }
 
@@ -856,10 +856,7 @@ public class ENCRYPT extends Protocol {
                                                                                   NoSuchPaddingException,
                                                                                   NoSuchAlgorithmException,
                                                                                   NoSuchProviderException {
-        Message newMsg;
-
-        if(log.isDebugEnabled())
-            log.debug("encoding shared key ");
+        log.debug("encoding shared key ");
 
         // create a cipher with peer's public key
         Cipher tmp;
@@ -871,11 +868,10 @@ public class ENCRYPT extends Protocol {
 
         //encrypt current secret key
         byte[] encryptedKey=tmp.doFinal(secret.getEncoded());
-        newMsg=new Message(source, local_addr, encryptedKey)
+        Message newMsg=new Message(source, local_addr, encryptedKey)
           .putHeader(this.id, new EncryptHeader(EncryptHeader.SECRETKEY, getSymVersion()));
 
-        if(log.isDebugEnabled())
-            log.debug(" Sending version " + getSymVersion() + " encoded key to client");
+        log.debug("sending version " + getSymVersion() + " encoded key to client");
         passItDown(new Event(Event.MSG,newMsg));
     }
 
@@ -987,7 +983,8 @@ public class ENCRYPT extends Protocol {
         }
 
         EncryptHeader hdr=new EncryptHeader(EncryptHeader.ENCRYPT, getSymVersion());
-        hdr.encrypt_entire_msg=this.encrypt_entire_message;
+        if(this.encrypt_entire_message)
+            hdr.type|=EncryptHeader.ENCRYPT_ENTIRE_MSG;
 
         if(encrypt_entire_message) {
             if(msg.getSrc() == null)
@@ -1230,37 +1227,35 @@ public class ENCRYPT extends Protocol {
     }
 
     public static class EncryptHeader extends org.jgroups.Header {
-        short type;
-        public static final short ENCRYPT     = 0;
-        public static final short KEY_REQUEST = 1;
-        public static final short SECRETKEY   = 2;
+        public static final byte ENCRYPT            = 1 << 0;
+        public static final byte KEY_REQUEST        = 1 << 1;
+        public static final byte SECRETKEY          = 1 << 2;
+        public static final byte ENCRYPT_ENTIRE_MSG = 1 << 3;
 
-        String version;
-        boolean encrypt_entire_msg=false;
+        protected byte type;
+        protected String version;
+
 
         public EncryptHeader() {}
 
-        public EncryptHeader(short type) {
-            this.type=type;
-            this.version="";
-        }
 
-        public EncryptHeader(short type,String version) {
+        public EncryptHeader(byte type,String version) {
             this.type=type;
             this.version=version;
         }
 
+        public boolean encryptEntireMessage() {
+            return Util.isFlagSet(type, ENCRYPT_ENTIRE_MSG);
+        }
 
         public void writeTo(DataOutput out) throws Exception {
-            out.writeShort(type);
+            out.writeByte(type);
             Bits.writeString(version,out);
-            out.writeBoolean(encrypt_entire_msg);
         }
 
         public void readFrom(DataInput in) throws Exception {
-            type=in.readShort();
+            type=in.readByte();
             version=Bits.readString(in);
-            encrypt_entire_msg=in.readBoolean();
         }
 
         public String toString() {
@@ -1268,7 +1263,7 @@ public class ENCRYPT extends Protocol {
         }
 
         public int size() {
-            int retval=Global.SHORT_SIZE + Global.BYTE_SIZE + Global.BYTE_SIZE;
+            int retval=Global.BYTE_SIZE *2;
             if(version != null)
                 retval+=version.length() + 2;
             return retval;
