@@ -1232,7 +1232,7 @@ public class ENCRYPT extends Protocol {
         public static final byte SECRETKEY          = 1 << 2;
         public static final byte ENCRYPT_ENTIRE_MSG = 1 << 3;
 
-        protected byte type;
+        private   byte   type;
         protected String version;
 
 
@@ -1242,6 +1242,17 @@ public class ENCRYPT extends Protocol {
         public EncryptHeader(byte type,String version) {
             this.type=type;
             this.version=version;
+        }
+
+        public byte getType() {
+            return (byte)(type ^ ENCRYPT_ENTIRE_MSG);
+        }
+
+        /**
+         * @return Returns the version.
+         */
+        protected String getVersion() {
+            return version;
         }
 
         public boolean encryptEntireMessage() {
@@ -1270,18 +1281,7 @@ public class ENCRYPT extends Protocol {
         }
 
 
-        /**
-         * @return Returns the type.
-         */
-        protected short getType() {
-            return type;
-        }
 
-        /**
-         * @return Returns the version.
-         */
-        protected String getVersion() {
-            return version;
-        }
+
     }
 }
