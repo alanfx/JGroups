@@ -15,6 +15,7 @@ import java.io.*;
 import java.security.*;
 import java.security.cert.CertificateException;
 import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
@@ -179,12 +180,13 @@ public class ENCRYPT extends Protocol {
     protected final Lock decrypt_lock=new ReentrantLock();
 
     // version filed for secret key
-    private String symVersion;
+    private byte[] symVersion;
+
     // dhared secret key to encrypt/decrypt messages
     SecretKey secretKey;
 
     // map to hold previous keys so we can decrypt some earlier messages if we need to
-    final Map<String,Cipher> keyMap=new WeakHashMap<String,Cipher>();
+    final Map<AsciiString,Cipher> keyMap=new WeakHashMap<AsciiString,Cipher>();
 
     // queues to buffer data while we are swapping shared key
     // or obtsining key for first time
@@ -363,10 +365,10 @@ public class ENCRYPT extends Protocol {
         digest.reset();
         digest.update(secret.getEncoded());
 
-        symVersion = byteArrayToHexString(digest.digest());
-        if(log.isDebugEnabled()) {
-            log.debug(" Initialized symmetric ciphers with secret key (" + symVersion.length() + " bytes)");
-        }
+        byte[] tmp=digest.digest();
+        symVersion=Arrays.copyOf(tmp, tmp.length);
+        // symVersion = byteArrayToHexString(digest.digest());
+        log.debug("initialized symmetric ciphers with secret key (" + symVersion.length + " bytes)");
     }
 
     public static String byteArrayToHexString(byte[] b){
@@ -766,11 +768,11 @@ public class ENCRYPT extends Protocol {
      * @param version
      * @throws Exception
      */
-    private void setKeys(SecretKey key, String version) throws Exception {
+    private void setKeys(SecretKey key, byte[] version) throws Exception {
 
         // put the previous key into the map
         // if the keys are already there then they will overwrite
-        keyMap.put(getSymVersion(), getSymDecodingCipher());
+        keyMap.put(new AsciiString(getSymVersion()), getSymDecodingCipher());
 
         setSecretKey(key);
         initSymCiphers(key.getAlgorithm(), key);
@@ -796,16 +798,16 @@ public class ENCRYPT extends Protocol {
      */
     private Message decryptMessage(Cipher cipher, Message msg) throws Exception {
         EncryptHeader hdr=(EncryptHeader)msg.getHeader(this.id);
-        if(!hdr.getVersion().equals(getSymVersion())) {
+        if(!Arrays.equals(hdr.getVersion(),getSymVersion())) {
             log.warn("attempting to use stored cipher as message does not use current encryption version ");
-            cipher=keyMap.get(hdr.getVersion());
+            cipher=keyMap.get(new AsciiString(hdr.getVersion()));
             if(cipher == null) {
                 log.warn("Unable to find a matching cipher in previous key map");
                 return null;
             }
             else {
                 if(log.isTraceEnabled())
-                    log.trace("decrypting using previous cipher version " + hdr.getVersion());
+                    log.trace("decrypting using previous cipher version");
                 return _decrypt(cipher, msg, hdr.encryptEntireMessage());
             }
         }
@@ -871,7 +873,7 @@ public class ENCRYPT extends Protocol {
         Message newMsg=new Message(source, local_addr, encryptedKey)
           .putHeader(this.id, new EncryptHeader(EncryptHeader.SECRETKEY, getSymVersion()));
 
-        log.debug("sending version " + getSymVersion() + " encoded key to client");
+        log.debug("sending version " + new String(getSymVersion()) + " encoded key to client");
         passItDown(new Event(Event.MSG,newMsg));
     }
 
@@ -1148,16 +1150,15 @@ public class ENCRYPT extends Protocol {
     /**
      * @return Returns the symVersion.
      */
-    private String getSymVersion() {
+    private byte[] getSymVersion() {
         return symVersion;
     }
 
     /**
-     * @param symVersion
-     *                The symVersion to set.
+     * @param symVersion the symVersion to set.
      */
-    private void setSymVersion(String symVersion) {
-        this.symVersion=symVersion;
+    private void setSymVersion(byte[] symVersion) {
+        this.symVersion=Arrays.copyOf(symVersion, symVersion.length);
     }
 
     /**
@@ -1233,25 +1234,27 @@ public class ENCRYPT extends Protocol {
         public static final byte ENCRYPT_ENTIRE_MSG = 1 << 3;
 
         private   byte   type;
-        protected String version;
+        protected byte[] version;
 
 
         public EncryptHeader() {}
 
 
-        public EncryptHeader(byte type,String version) {
+        public EncryptHeader(byte type, byte[] version) {
             this.type=type;
             this.version=version;
+            if(version == null)
+                throw new IllegalArgumentException("version must be defined");
         }
 
         public byte getType() {
-            return (byte)(type ^ ENCRYPT_ENTIRE_MSG);
+            return (byte)(type & ~ENCRYPT_ENTIRE_MSG); // clear the ENCRYPT_ENTIRE_MSG flag
         }
 
         /**
          * @return Returns the version.
          */
-        protected String getVersion() {
+        protected byte[] getVersion() {
             return version;
         }
 
@@ -1261,22 +1264,24 @@ public class ENCRYPT extends Protocol {
 
         public void writeTo(DataOutput out) throws Exception {
             out.writeByte(type);
-            Bits.writeString(version,out);
+            out.writeShort(version.length);
+            out.write(version);
         }
 
         public void readFrom(DataInput in) throws Exception {
             type=in.readByte();
-            version=Bits.readString(in);
+            short len=in.readShort();
+            version=new byte[len];
+            in.readFully(version);
         }
 
         public String toString() {
-            return "ENCRYPT [type=" + type + " version=\"" + (version != null? version.length() + " bytes" : "n/a") + "\"]";
+            return "ENCRYPT [type=" + type + " version=\"" + (version != null? version.length + " bytes" : "n/a") + "\"]";
         }
 
         public int size() {
-            int retval=Global.BYTE_SIZE *2;
-            if(version != null)
-                retval+=version.length() + 2;
+            int retval=Global.BYTE_SIZE *2 + Global.SHORT_SIZE;
+            retval+=version.length;
             return retval;
         }
 

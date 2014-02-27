@@ -135,12 +135,12 @@ public class ENCRYPTAsymmetricTest {
         digest.update(encrypt.getDesKey().getEncoded());
 
         // String symVersion=new String(digest.digest(), "UTF-8");
-        String symVersion=ENCRYPT.byteArrayToHexString(digest.digest());
+        // String symVersion=ENCRYPT.byteArrayToHexString(digest.digest());
+        byte[] symVersion=digest.digest();
 
         encrypt.keyServer=false;
-        Message msg=new Message();
-        msg.setBuffer(cipher.doFinal("hello".getBytes()));
-        msg.putHeader(ENCRYPT_ID, new EncryptHeader(EncryptHeader.ENCRYPT, symVersion));
+        Message msg=new Message().setBuffer(cipher.doFinal("hello".getBytes()))
+          .putHeader(ENCRYPT_ID, new EncryptHeader(EncryptHeader.ENCRYPT, symVersion));
 
         Event evt=new Event(Event.MSG, msg);
 
@@ -218,13 +218,13 @@ public class ENCRYPTAsymmetricTest {
         digest.update(server.getDesKey().getEncoded());
 
         // String symVersion=new String(digest.digest(), "UTF-8");
-        String symVersion=ENCRYPT.byteArrayToHexString(digest.digest());
+        // String symVersion=ENCRYPT.byteArrayToHexString(digest.digest());
+        byte[] symVersion=digest.digest();
 
         // encrypt and send an initial message to peer
         Cipher cipher=server.getSymEncodingCipher();
-        Message msg=new Message();
-        msg.setBuffer(cipher.doFinal("hello".getBytes()));
-        msg.putHeader(ENCRYPT_ID, new EncryptHeader(EncryptHeader.ENCRYPT, symVersion));
+        Message msg=new Message().setBuffer(cipher.doFinal("hello".getBytes()))
+          .putHeader(ENCRYPT_ID, new EncryptHeader(EncryptHeader.ENCRYPT, symVersion));
 
         Event evt=new Event(Event.MSG, msg);
 

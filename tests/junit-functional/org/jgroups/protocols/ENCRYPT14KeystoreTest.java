@@ -101,7 +101,8 @@ public class ENCRYPT14KeystoreTest {
         digest.update(encrypt.getDesKey().getEncoded());
 
         //String symVersion=new String(digest.digest(), "UTF-8");
-        String symVersion=ENCRYPT.byteArrayToHexString(digest.digest());
+        // String symVersion=ENCRYPT.byteArrayToHexString(digest.digest());
+        byte[] symVersion=digest.digest();
 
         Message msg=new Message(null, null, encodedBytes);
         msg.putHeader(ENCRYPT_ID, new ENCRYPT.EncryptHeader(ENCRYPT.EncryptHeader.ENCRYPT, symVersion));
@@ -139,7 +140,8 @@ public class ENCRYPT14KeystoreTest {
         digest.update(encrypt2.getDesKey().getEncoded());
 
         // String symVersion=new String(digest.digest());
-        String symVersion=ENCRYPT.byteArrayToHexString(digest.digest());
+        // String symVersion=ENCRYPT.byteArrayToHexString(digest.digest());
+        byte[] symVersion=digest.digest();
 
         Message msg=new Message(null, null, encodedBytes);
         msg.putHeader(ENCRYPT_ID, new ENCRYPT.EncryptHeader(ENCRYPT.EncryptHeader.ENCRYPT, symVersion));
