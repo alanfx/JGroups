@@ -473,66 +473,82 @@ public class ENCRYPT extends Protocol {
 
 
     public void up(MessageBatch batch) {
-        for(Message msg: batch) {
-            if(msg.getLength() == 0 && !encrypt_entire_message)
-                continue;
+        Lock lock=null;
+        Cipher cipher=null;
 
-            EncryptHeader hdr=(EncryptHeader)msg.getHeader(this.id);
-            if(hdr == null) {
-                if(log.isTraceEnabled())
-                    log.trace("dropping message as ENCRYPT header is null or has not been recognized, msg will not be passed up, " +
-                                "headers are " + msg.printHeaders());
-                batch.remove(msg);
-                continue;
-            }
+        try {
+            for(Message msg: batch) {
+                if(msg.getLength() == 0 && !encrypt_entire_message)
+                    continue;
 
-            switch(hdr.getType()) {
-                case EncryptHeader.ENCRYPT:
-                    // if msg buffer is empty, and we didn't encrypt the entire message, just pass up
-                    if(!hdr.encryptEntireMessage() && msg.getLength() == 0)
-                        break;
+                EncryptHeader hdr=(EncryptHeader)msg.getHeader(this.id);
+                if(hdr == null) {
+                    if(log.isTraceEnabled())
+                        log.trace("dropping message as ENCRYPT header is null or has not been recognized, msg will not be passed up, " +
+                                    "headers are " + msg.printHeaders());
+                    batch.remove(msg);
+                    continue;
+                }
 
-                    // if queueing then pass into queue to be dealt with later
-                    if(queue_up) {
-                        if(log.isTraceEnabled())
-                            log.trace("queueing up message as no session key established: " + msg);
-                        try {
-                            upMessageQueue.put(msg);
-                        }
-                        catch(InterruptedException e) {
-                        }
-                    }
-                    else {
-                        // make sure we pass up any queued messages first
-                        // could be more optimised but this can wait we only need this if not using supplied key
-                        if(!suppliedKey) {
+                switch(hdr.getType()) {
+                    case EncryptHeader.ENCRYPT:
+                        // if msg buffer is empty, and we didn't encrypt the entire message, just pass up
+                        if(!hdr.encryptEntireMessage() && msg.getLength() == 0)
+                            break;
+
+                        // if queueing then pass into queue to be dealt with later
+                        if(queue_up) {
+                            if(log.isTraceEnabled())
+                                log.trace("queueing up message as no session key established: " + msg);
                             try {
-                                drainUpQueue();
+                                upMessageQueue.put(msg);
+                            }
+                            catch(InterruptedException e) {
+                            }
+                        }
+                        else {
+                            // make sure we pass up any queued messages first
+                            // could be more optimised but this can wait we only need this if not using supplied key
+                            if(!suppliedKey) {
+                                try {
+                                    drainUpQueue();
+                                }
+                                catch(Exception e) {
+                                    log.error("failed draining up queue", e);
+                                }
+                            }
+
+                            // try and decrypt the message - we need to copy msg as we modify its
+                            // buffer (http://jira.jboss.com/jira/browse/JGRP-538)
+                            try {
+                                if(lock == null) {
+                                    int index=getRandomIndex(cipher_pool_size);
+                                    lock=decoding_locks[index];
+                                    cipher=decoding_ciphers[index];
+                                    lock.lock();
+                                }
+
+                                Message tmpMsg=decryptMessage(cipher, msg.copy());
+                                if(tmpMsg != null)
+                                    batch.replace(msg, tmpMsg);
+                                else
+                                    log.warn("unrecognised cipher; discarding message");
                             }
                             catch(Exception e) {
-                                log.error("failed draining up queue", e);
+                                log.error("failed decrypting message", e);
                             }
                         }
-
-                        // try and decrypt the message - we need to copy msg as we modify its
-                        // buffer (http://jira.jboss.com/jira/browse/JGRP-538)
-                        try {
-                            Message tmpMsg=decryptMessage(msg.copy());
-                            if(tmpMsg != null)
-                                batch.replace(msg, tmpMsg);
-                            else
-                                log.warn("unrecognised cipher; discarding message");
-                        }
-                        catch(Exception e) {
-                            log.error("failed decrypting message", e);
-                        }
-                    }
-                    break;
-                default:
-                    batch.remove(msg); // a control message will get handled by ENCRYPT and should not be passed up
-                    handleUpEvent(msg, hdr);
-                    break;
+                        break;
+                    default:
+                        batch.remove(msg); // a control message will get handled by ENCRYPT and should not be passed up
+                        handleUpEvent(msg, hdr);
+                        break;
+                }
             }
+        }
+        finally {
+            if(lock != null)
+                lock.unlock();
         }
 
         if(!batch.isEmpty())
@@ -675,7 +691,7 @@ public class ENCRYPT extends Protocol {
 
             // try and decrypt the message - we need to copy msg as we modify its
             // buffer (http://jira.jboss.com/jira/browse/JGRP-538)
-            Message tmpMsg=decryptMessage(msg.copy());
+            Message tmpMsg=decryptMessage(null, msg.copy()); // pick a random cipher
             if(tmpMsg != null) {
                 if(log.isTraceEnabled())
                     log.trace("decrypted message " + tmpMsg);
@@ -749,7 +765,7 @@ public class ENCRYPT extends Protocol {
         }
         Message tmp=null;
         while((tmp=upMessageQueue.poll(0L, TimeUnit.MILLISECONDS)) != null) {
-            Message msg=decryptMessage(tmp.copy());
+            Message msg=decryptMessage(null, tmp.copy()); // pick a random cipher
 
             if(msg != null)
                 passItUp(new Event(Event.MSG, msg));
@@ -791,23 +807,25 @@ public class ENCRYPT extends Protocol {
     /**
      * Does the actual work for decrypting - if version does not match current cipher then tries the previous cipher
      */
-    private Message decryptMessage(Message msg) throws Exception {
+    private Message decryptMessage(Cipher cipher, Message msg) throws Exception {
         EncryptHeader hdr=(EncryptHeader)msg.getHeader(this.id);
         if(!Arrays.equals(hdr.getVersion(),getSymVersion())) {
             log.warn("attempting to use stored cipher as message does not use current encryption version ");
-            Cipher cipher=keyMap.get(new AsciiString(hdr.getVersion()));
+            cipher=keyMap.get(new AsciiString(hdr.getVersion()));
             if(cipher == null) {
                 log.warn("unable to find a matching cipher in previous key map");
                 return null;
             }
             else {
                 log.trace("decrypting using previous cipher version");
-                return _decrypt(cipher, msg, hdr.encryptEntireMessage());
+                synchronized(cipher) {
+                    return _decrypt(cipher, msg, hdr.encryptEntireMessage());
+                }
             }
         }
         else {
             // reset buffer with decrypted message
-            return _decrypt(null, msg, hdr.encryptEntireMessage());
+            return _decrypt(cipher, msg, hdr.encryptEntireMessage());
         }
     }
 
@@ -816,11 +834,8 @@ public class ENCRYPT extends Protocol {
 
         if(cipher == null)
             decrypted_msg=code(msg.getRawBuffer(), msg.getOffset(), msg.getLength(), true);
-        else {
-            synchronized(cipher) {
-                decrypted_msg=cipher.doFinal(msg.getRawBuffer(), msg.getOffset(), msg.getLength());
-            }
-        }
+        else
+            decrypted_msg=cipher.doFinal(msg.getRawBuffer(), msg.getOffset(), msg.getLength());
 
         if(!decrypt_entire_msg) {
             msg.setBuffer(decrypted_msg);
