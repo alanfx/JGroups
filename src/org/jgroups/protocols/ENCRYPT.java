@@ -1,24 +1,20 @@
-
 package org.jgroups.protocols;
 
 import org.jgroups.*;
-import org.jgroups.annotations.GuardedBy;
 import org.jgroups.annotations.MBean;
 import org.jgroups.annotations.Property;
 import org.jgroups.stack.Protocol;
 import org.jgroups.util.*;
 
-import javax.crypto.*;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
-
 import java.io.*;
 import java.security.*;
 import java.security.cert.CertificateException;
 import java.security.spec.X509EncodedKeySpec;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.WeakHashMap;
+import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -102,15 +98,6 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 @MBean(description="Protocol which encrypts and decrypts cluster traffic")
 public class ENCRYPT extends Protocol {
-    protected Observer observer;
-
-    interface Observer {
-        void up(Event evt);
-        void passUp(Event evt);
-        void down(Event evt);
-        void passDown(Event evt);
-    }
-
     private static final String DEFAULT_SYM_ALGO="AES";
     Address local_addr;
     Address keyServerAddr;
@@ -166,13 +153,6 @@ public class ENCRYPT extends Protocol {
     //	 for client to store server's public Key
     PublicKey serverPubKey=null;
 
-    // needed because we do simultaneous encode/decode with these ciphers - which
-    // would be a threading issue
-    Cipher symEncodingCipher;
-
-    @GuardedBy("decrypt_lock")
-    Cipher symDecodingCipher;
-
     // Cipher pools used for encryption and decryption. Size is cipher_pool_size
     protected Cipher[] encoding_ciphers, decoding_ciphers;
 
@@ -207,9 +187,6 @@ public class ENCRYPT extends Protocol {
     @Property
     private boolean encrypt_entire_message=false;
 
-    public void setObserver(Observer o) {
-        observer=o;
-    }
 
     /*
       * GetAlgorithm: Get the algorithm name from "algorithm/mode/padding"
@@ -354,19 +331,7 @@ public class ENCRYPT extends Protocol {
      * @throws Exception
      */
     private void initSymCiphers(String algorithm, SecretKey secret) throws Exception {
-        log.debug("initializing symmetric ciphers");
-
-        if(symProvider != null && !symProvider.trim().isEmpty()) {
-            symEncodingCipher=Cipher.getInstance(algorithm, symProvider);
-            symDecodingCipher=Cipher.getInstance(algorithm, symProvider);
-        }
-        else {
-            symEncodingCipher=Cipher.getInstance(algorithm);
-            symDecodingCipher=Cipher.getInstance(algorithm);
-        }
-
-        symEncodingCipher.init(Cipher.ENCRYPT_MODE, secret);
-        symDecodingCipher.init(Cipher.DECRYPT_MODE, secret);
+        log.debug("initializing symmetric ciphers (pool size=%d)", cipher_pool_size);
 
         for(int i=0; i < cipher_pool_size; i++) {
             encoding_ciphers[i]=symProvider != null && !symProvider.trim().isEmpty()?
@@ -468,7 +433,7 @@ public class ENCRYPT extends Protocol {
             default:
                 break;
         }
-        return passItUp(evt);
+        return up_prot.up(evt);
     }
 
 
@@ -555,11 +520,7 @@ public class ENCRYPT extends Protocol {
             up_prot.up(batch);
     }
 
-    public Object passItUp(Event evt) {
-        if(observer != null)
-            observer.passUp(evt);
-        return up_prot != null? up_prot.up(evt) : null;
-    }
+
 
     private synchronized void handleViewChange(View view, boolean makeServer) {
     	if(makeServer)
@@ -645,13 +606,13 @@ public class ENCRYPT extends Protocol {
     private void handleUpMessage(Event evt) throws Exception {
         Message msg=(Message)evt.getArg();
         if(msg == null || (msg.getLength() == 0 && !encrypt_entire_message)) {
-            passItUp(evt);
+            up_prot.up(evt);
             return;
         }
 
         EncryptHeader hdr=(EncryptHeader)msg.getHeader(this.id);
         if(hdr == null) {
-            log.trace("dropping message as ENCRYPT header is null or has not been recognized, msg will not be passed up, " +
+            log.warn("dropping message as ENCRYPT header is null or has not been recognized, msg will not be passed up, " +
                         "headers are %s", msg.printHeaders());
             return;
         }
@@ -664,7 +625,7 @@ public class ENCRYPT extends Protocol {
                 handleEncryptedMessage(msg, evt, hdr);
                 break;
             default:
-                handleUpEvent(msg, hdr);
+                handleUpEvent(msg,hdr);
                 break;
         }
     }
@@ -674,7 +635,7 @@ public class ENCRYPT extends Protocol {
     protected void handleEncryptedMessage(Message msg, Event evt, EncryptHeader hdr) throws Exception {
         // if msg buffer is empty, and we didn't encrypt the entire message, just pass up
         if(!hdr.encryptEntireMessage() && msg.getLength() == 0) {
-            passItUp(evt);
+            up_prot.up(evt);
             return;
         }
 
@@ -695,7 +656,7 @@ public class ENCRYPT extends Protocol {
             if(tmpMsg != null) {
                 if(log.isTraceEnabled())
                     log.trace("decrypted message " + tmpMsg);
-                passItUp(new Event(Event.MSG, tmpMsg));
+                up_prot.up(new Event(Event.MSG, tmpMsg));
             }
             else
                 log.warn("unrecognised cipher discarding message");
@@ -768,7 +729,7 @@ public class ENCRYPT extends Protocol {
             Message msg=decryptMessage(null, tmp.copy()); // pick a random cipher
 
             if(msg != null)
-                passItUp(new Event(Event.MSG, msg));
+                up_prot.up(new Event(Event.MSG, msg));
             else
                 log.warn("discarding message in queue up drain as cannot decode it");
         }
@@ -830,8 +791,7 @@ public class ENCRYPT extends Protocol {
     }
 
     private Message _decrypt(final Cipher cipher, Message msg, boolean decrypt_entire_msg) throws Exception {
-        byte[] decrypted_msg=null;
-
+        byte[] decrypted_msg;
         if(cipher == null)
             decrypted_msg=code(msg.getRawBuffer(), msg.getOffset(), msg.getLength(), true);
         else
@@ -842,7 +802,7 @@ public class ENCRYPT extends Protocol {
             return msg;
         }
 
-        Message ret=(Message)Util.streamableFromByteBuffer(Message.class, decrypted_msg);
+        Message ret=Util.streamableFromBuffer(Message.class,decrypted_msg,0,decrypted_msg.length);
         if(ret.getDest() == null)
             ret.setDest(msg.getDest());
         if(ret.getSrc() == null)
@@ -850,21 +810,7 @@ public class ENCRYPT extends Protocol {
         return ret;
     }
 
-    /**
-     * @param secret
-     * @param pubKey
-     * @throws InvalidKeyException
-     * @throws IllegalStateException
-     * @throws IllegalBlockSizeException
-     * @throws BadPaddingException
-     */
-    private void sendSecretKey(SecretKey secret, PublicKey pubKey, Address source) throws InvalidKeyException,
-                                                                                  IllegalStateException,
-                                                                                  IllegalBlockSizeException,
-                                                                                  BadPaddingException,
-                                                                                  NoSuchPaddingException,
-                                                                                  NoSuchAlgorithmException,
-                                                                                  NoSuchProviderException {
+    private void sendSecretKey(SecretKey secret, PublicKey pubKey, Address source) throws Exception {
         // create a cipher with peer's public key
         Cipher tmp;
         if (asymProvider != null && !asymProvider.trim().isEmpty())
@@ -879,28 +825,19 @@ public class ENCRYPT extends Protocol {
           .putHeader(this.id, new EncryptHeader(EncryptHeader.SECRETKEY, getSymVersion()));
 
         log.debug("sending version %s encoded key to client", new String(getSymVersion()));
-        passItDown(new Event(Event.MSG,newMsg));
+        down_prot.down(new Event(Event.MSG,newMsg));
     }
 
 
 
-    /**
-     * @return Message
-     */
-    private Message sendKeyRequest() {
-
-        // send client's public key to server and request
-        // server's public key
+    /** send client's public key to server and request server's public key */
+    private void sendKeyRequest() {
         Message newMsg=new Message(keyServerAddr, local_addr, Kpair.getPublic().getEncoded())
           .putHeader(this.id,new EncryptHeader(EncryptHeader.KEY_REQUEST,getSymVersion()));
-        passItDown(new Event(Event.MSG,newMsg));
-        return newMsg;
+        down_prot.down(new Event(Event.MSG, newMsg));
     }
 
     public Object down(Event evt) {
-        if(observer != null)
-            observer.down(evt);
-
         switch(evt.getType()) {
 
             case Event.MSG:
@@ -949,11 +886,6 @@ public class ENCRYPT extends Protocol {
         return down_prot.down(evt);
     }
 
-    public Object passItDown(Event evt) {
-        if(observer != null)
-            observer.passDown(evt);
-        return down_prot != null? down_prot.down(evt) : null;
-    }
 
     /**
      * @throws Exception
@@ -973,7 +905,7 @@ public class ENCRYPT extends Protocol {
 
     private void sendDown(Message msg) throws Exception {
         if(msg.getLength() == 0 && !encrypt_entire_message) {
-            passItDown(new Event(Event.MSG, msg));
+            down_prot.down(new Event(Event.MSG, msg));
             return;
         }
 
@@ -984,21 +916,24 @@ public class ENCRYPT extends Protocol {
         if(encrypt_entire_message) {
             if(msg.getSrc() == null)
                 msg.setSrc(local_addr);
+
             Buffer serialized_msg=Util.streamableToBuffer(msg);
             byte[] encrypted_msg=code(serialized_msg.getBuf(),serialized_msg.getOffset(),serialized_msg.getLength(),false);
+
             // we need to exclude existing headers, they will be seen again when we decrypt and unmarshal the message
             // on the receiver
-            Message tmp=msg.copy(false, false).setBuffer(encrypted_msg).putHeader(this.id,hdr);
+            // Message tmp=msg.copy(false, false).setBuffer(encrypted_msg).putHeader(this.id,hdr);
+            Message tmp=msg.copy(false).setBuffer(encrypted_msg).putHeader(this.id,hdr);
             if(tmp.getSrc() == null)
                 tmp.setSrc(local_addr);
-            passItDown(new Event(Event.MSG, tmp));
+            down_prot.down(new Event(Event.MSG, tmp));
             return;
         }
 
         // copy neeeded because same message (object) may be retransmitted -> no double encryption
         Message msgEncrypted=msg.copy(false).putHeader(this.id, hdr)
           .setBuffer(code(msg.getRawBuffer(),msg.getOffset(),msg.getLength(),false));
-        passItDown(new Event(Event.MSG, msgEncrypted));
+        down_prot.down(new Event(Event.MSG, msgEncrypted));
     }
 
 
@@ -1143,7 +1078,7 @@ public class ENCRYPT extends Protocol {
     /**
      * @return Returns the symVersion.
      */
-    private byte[] getSymVersion() {
+    public byte[] getSymVersion() {
         return symVersion;
     }
 
@@ -1177,17 +1112,17 @@ public class ENCRYPT extends Protocol {
     }
 
     /**
-     * @return Returns the symDecodingCipher.
+     * @return Returns a decoding cipher randomly chosen from the cipher pool
      */
-    protected Cipher getSymDecodingCipher() {
-        return symDecodingCipher;
+    public Cipher getSymDecodingCipher() {
+        return decoding_ciphers[getRandomIndex(decoding_ciphers.length)];
     }
 
     /**
-     * @return Returns the symEncodingCipher.
+     * @return Returns an encoding cipher randomly chosen from the cipher pool
      */
-    protected Cipher getSymEncodingCipher() {
-        return symEncodingCipher;
+    public Cipher getSymEncodingCipher() {
+        return encoding_ciphers[getRandomIndex(encoding_ciphers.length)];
     }
 
     /**
