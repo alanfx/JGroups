@@ -467,6 +467,7 @@ public class ENCRYPT extends Protocol {
                                 log.trace("queueing up message as no session key established: " + msg);
                             try {
                                 upMessageQueue.put(msg);
+                                batch.remove(msg);
                             }
                             catch(InterruptedException e) {
                             }
