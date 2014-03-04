@@ -14,10 +14,11 @@ import java.io.*;
 import java.security.*;
 import java.security.cert.CertificateException;
 import java.security.spec.X509EncodedKeySpec;
-import java.util.*;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -102,6 +103,7 @@ public class ENCRYPT extends Protocol {
     Address local_addr;
     Address keyServerAddr;
     boolean keyServer=false; //used to see whether we are the key server
+    protected ExecutorService timer;
     
     /* -----------------------------------------    Properties     -------------------------------------------------- */
 
@@ -201,6 +203,8 @@ public class ENCRYPT extends Protocol {
     }
 
     public void init() throws Exception {
+        timer=new ThreadPoolExecutor(2, 10, 5000, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(200));
+
         if(keyPassword == null && storePassword != null) {
             keyPassword=storePassword;
             log.debug("key_password used is same as store_password");
@@ -230,6 +234,11 @@ public class ENCRYPT extends Protocol {
         decoding_locks=new Lock[cipher_pool_size];
 
         initSymCiphers(symAlgorithm, getSecretKey());
+    }
+
+    public void destroy() {
+        super.destroy();
+        timer.shutdown();
     }
 
     /**
@@ -437,7 +446,7 @@ public class ENCRYPT extends Protocol {
     }
 
 
-    public void up(MessageBatch batch) {
+    /*public void up(MessageBatch batch) {
         Lock lock=null;
         Cipher cipher=null;
 
@@ -518,12 +527,113 @@ public class ENCRYPT extends Protocol {
         if(!batch.isEmpty())
             up_prot.up(batch);
     }
+*/
+
+    protected class Decrypter implements Runnable {
+        protected final Message      msg;
+        protected final MessageBatch batch;
+
+        public Decrypter(Message msg, MessageBatch batch) {
+            this.msg=msg;
+            this.batch=batch;
+        }
+
+        public void run() {
+            // try and decrypt the message - we need to copy msg as we modify its
+            // buffer (http://jira.jboss.com/jira/browse/JGRP-538)
+            try {
+                Message tmpMsg=decryptMessage(null, msg.copy());
+                if(tmpMsg != null)
+                    batch.replace(msg, tmpMsg);
+            }
+            catch(Exception e) {
+                log.error("failed decrypting message", e);
+            }
+        }
+    }
+
+
+    protected class DecryptVisitor implements MessageBatch.Visitor<Message> {
+        protected final Future<?>[] decrypters;
+        protected int index;
+
+        public DecryptVisitor(Future<?>[] decrypters) {
+            this.decrypters=decrypters;
+        }
+
+        public Message visit(Message msg, MessageBatch batch) {
+            if(msg == null || (msg.getLength() == 0 && !encrypt_entire_message))
+                return null;
+
+            EncryptHeader hdr=(EncryptHeader)msg.getHeader(id);
+            if(hdr == null) {
+                if(log.isTraceEnabled())
+                    log.trace("dropping message as ENCRYPT header is null or has not been recognized, msg will not be passed up, " +
+                                "headers are " + msg.printHeaders());
+                batch.remove(msg);
+                return null;
+            }
+            if(hdr.getType() != EncryptHeader.ENCRYPT) {
+                batch.remove(msg);
+                handleUpEvent(msg, hdr);
+            }
+            if(!hdr.encryptEntireMessage() && msg.getLength() == 0)
+                return null;
+
+            // if queueing then pass into queue to be dealt with later
+            if(queue_up) {
+                if(log.isTraceEnabled())
+                    log.trace("queueing up message as no session key established: " + msg);
+                try {
+                    upMessageQueue.put(msg);
+                    batch.remove(msg);
+                }
+                catch(InterruptedException e) {
+                }
+                return null;
+            }
+
+            // make sure we pass up any queued messages first
+            // could be more optimised but this can wait we only need this if not using supplied key
+            if(!suppliedKey) {
+                try {
+                    drainUpQueue();
+                }
+                catch(Exception e) {
+                    log.error("failed draining up queue", e);
+                }
+            }
+
+            decrypters[index++]=timer.submit(new Decrypter(msg,batch));
+            return null;
+        }
+    }
+
+
+    public void up(MessageBatch batch) {
+        final Future<?>[] decrypters=new Future<?>[batch.size()];
+        MessageBatch.Visitor<Message> visitor=new DecryptVisitor(decrypters);
+        batch.map(visitor);
+
+        for(Future<?> future: decrypters) {
+            try {
+                if(future != null && !future.isDone())
+                    future.get();
+            }
+            catch(Exception e) {
+                e.printStackTrace();
+            }
+        }
+
+        if(!batch.isEmpty())
+            up_prot.up(batch);
+    }
 
 
 
     private synchronized void handleViewChange(View view, boolean makeServer) {
-    	if(makeServer)
-    		initializeNewSymmetricKey();
+        if(makeServer)
+            initializeNewSymmetricKey();
 
         // if view is a bit broken set me as keyserver
         List<Address> members = view.getMembers();
@@ -704,7 +814,7 @@ public class ENCRYPT extends Protocol {
                 }
                 break;
             default:
-                log.warn("received ignored encrypt header of %s", hdr.getType());
+                log.warn("received ignored encrypt header of %s",hdr.getType());
                 break;
         }
     }

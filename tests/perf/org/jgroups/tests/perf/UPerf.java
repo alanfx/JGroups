@@ -32,6 +32,7 @@ public class UPerf extends ReceiverAdapter {
     static final String            groupname="uperf";
     protected final List<Address>  members=new ArrayList<Address>();
     protected final List<Address>  site_masters=new ArrayList<Address>();
+    protected TimeScheduler        timer;
 
 
     // ============ configurable properties ==================
@@ -81,13 +82,38 @@ public class UPerf extends ReceiverAdapter {
         channel=new JChannel(props);
         if(name != null)
             channel.setName(name);
+        timer=channel.getProtocolStack().getTransport().getTimer();
         disp=new RpcDispatcher(channel, null, this, this);
         disp.setMethodLookup(new MethodLookup() {
             public Method findMethod(short id) {
                 return METHODS[id];
             }
         });
-        channel.connect(groupname);
+        disp.asyncDispatching(true);
+        disp.setRequestHandler(new AsyncRequestHandler() {
+            public void handle(final Message request, final Response response) throws Exception {
+                timer.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            Object retval=disp.handle(request);
+                            if(response != null)
+                                response.send(retval, false);
+                        }
+                        catch(Exception e) {
+                            if(response != null)
+                                response.send(e, true);
+                        }
+                    }
+                });
+            }
+
+            public Object handle(Message msg) throws Exception {
+                return disp.handle(msg);
+            }
+        });
+
+
+                               channel.connect(groupname);
         local_addr=channel.getAddress();
 
         if(xsite) {
