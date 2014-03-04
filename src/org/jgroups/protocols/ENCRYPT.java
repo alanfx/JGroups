@@ -497,8 +497,6 @@ public class ENCRYPT extends Protocol {
                                 Message tmpMsg=decryptMessage(cipher, msg.copy());
                                 if(tmpMsg != null)
                                     batch.replace(msg, tmpMsg);
-                                else
-                                    log.warn("unrecognised cipher; discarding message");
                             }
                             catch(Exception e) {
                                 log.error("failed decrypting message", e);
@@ -728,7 +726,6 @@ public class ENCRYPT extends Protocol {
         Message tmp=null;
         while((tmp=upMessageQueue.poll(0L, TimeUnit.MILLISECONDS)) != null) {
             Message msg=decryptMessage(null, tmp.copy()); // pick a random cipher
-
             if(msg != null)
                 up_prot.up(new Event(Event.MSG, msg));
             else
@@ -778,11 +775,9 @@ public class ENCRYPT extends Protocol {
                 log.warn("unable to find a matching cipher in previous key map");
                 return null;
             }
-            else {
-                log.trace("decrypting using previous cipher version");
-                synchronized(cipher) {
-                    return _decrypt(cipher, msg, hdr.encryptEntireMessage());
-                }
+            log.trace("decrypting using previous cipher version");
+            synchronized(cipher) {
+                return _decrypt(cipher, msg, hdr.encryptEntireMessage());
             }
         }
         else {
@@ -1209,7 +1204,7 @@ public class ENCRYPT extends Protocol {
         }
 
         public int size() {
-            int retval=Global.BYTE_SIZE *2 + Global.SHORT_SIZE;
+            int retval=Global.BYTE_SIZE + Global.SHORT_SIZE;
             retval+=version.length;
             return retval;
         }
