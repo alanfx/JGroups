@@ -2,6 +2,7 @@ package org.jgroups.protocols;
 
 import org.jgroups.*;
 import org.jgroups.annotations.MBean;
+import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.Property;
 import org.jgroups.stack.Protocol;
 import org.jgroups.util.*;
@@ -14,10 +15,14 @@ import java.io.*;
 import java.security.*;
 import java.security.cert.CertificateException;
 import java.security.spec.X509EncodedKeySpec;
-import java.util.*;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -159,6 +164,8 @@ public class ENCRYPT extends Protocol {
     // Locks to synchronize access to the cipher pools
     protected Lock[] encoding_locks, decoding_locks;
 
+    protected final AtomicInteger cipher_index=new AtomicInteger(0); // the cipher and lock to select
+
     // version filed for secret key
     protected byte[] symVersion;
 
@@ -187,6 +194,12 @@ public class ENCRYPT extends Protocol {
     @Property
     private boolean encrypt_entire_message=false;
 
+    protected final Average avg_encrypt_time=new Average(50);
+    protected final Average avg_decrypt_time=new Average(50);
+    protected final Average avg_batch_processing_time=new Average(50);
+
+
+
 
     /*
       * GetAlgorithm: Get the algorithm name from "algorithm/mode/padding"
@@ -199,6 +212,20 @@ public class ENCRYPT extends Protocol {
 
         return s.substring(0, index);
     }
+
+    @ManagedAttribute(description="Avg time in us for message encryption")
+    public double getAvgEncryptTime() {
+        return avg_encrypt_time.getAverage();
+    }
+
+    @ManagedAttribute(description="Avg time in us for message decryption")
+    public double getAvgDecryptTime() {
+        return avg_decrypt_time.getAverage();
+    }
+
+    @ManagedAttribute(description="Avg time in us to process a batch")
+    public double getAvgBatchProcessingTime() {return avg_batch_processing_time.getAverage();}
+
 
     public void init() throws Exception {
         if(keyPassword == null && storePassword != null) {
@@ -331,7 +358,7 @@ public class ENCRYPT extends Protocol {
      * @throws Exception
      */
     private void initSymCiphers(String algorithm, SecretKey secret) throws Exception {
-        log.debug("initializing symmetric ciphers (pool size=%d)", cipher_pool_size);
+        log.debug("initializing symmetric ciphers (pool size=%d)",cipher_pool_size);
 
         for(int i=0; i < cipher_pool_size; i++) {
             encoding_ciphers[i]=symProvider != null && !symProvider.trim().isEmpty()?
@@ -384,7 +411,7 @@ public class ENCRYPT extends Protocol {
             KpairGen=KeyPairGenerator.getInstance(getAlgorithm(asymAlgorithm));
 
         }
-        KpairGen.initialize(asymInit, new SecureRandom());
+        KpairGen.initialize(asymInit,new SecureRandom());
         Kpair=KpairGen.generateKeyPair();
 
         // set up the Cipher to decrypt secret key responses encrypted with our key
@@ -394,7 +421,7 @@ public class ENCRYPT extends Protocol {
         else
             asymCipher=Cipher.getInstance(asymAlgorithm);
 
-        asymCipher.init(Cipher.DECRYPT_MODE, Kpair.getPrivate());
+        asymCipher.init(Cipher.DECRYPT_MODE,Kpair.getPrivate());
         log.debug("asym algo initialized");
     }
 
@@ -441,6 +468,7 @@ public class ENCRYPT extends Protocol {
         Lock lock=null;
         Cipher cipher=null;
 
+        long start=System.nanoTime();
         try {
             for(Message msg: batch) {
                 if(msg.getLength() == 0 && !encrypt_entire_message)
@@ -488,7 +516,7 @@ public class ENCRYPT extends Protocol {
                             // buffer (http://jira.jboss.com/jira/browse/JGRP-538)
                             try {
                                 if(lock == null) {
-                                    int index=getRandomIndex(cipher_pool_size);
+                                    int index=getNextIndex();
                                     lock=decoding_locks[index];
                                     cipher=decoding_ciphers[index];
                                     lock.lock();
@@ -513,6 +541,8 @@ public class ENCRYPT extends Protocol {
         finally {
             if(lock != null)
                 lock.unlock();
+            long time=System.nanoTime() - start;
+            avg_batch_processing_time.add(time / 1000);
         }
 
         if(!batch.isEmpty())
@@ -787,23 +817,30 @@ public class ENCRYPT extends Protocol {
     }
 
     private Message _decrypt(final Cipher cipher, Message msg, boolean decrypt_entire_msg) throws Exception {
-        byte[] decrypted_msg;
-        if(cipher == null)
-            decrypted_msg=code(msg.getRawBuffer(), msg.getOffset(), msg.getLength(), true);
-        else
-            decrypted_msg=cipher.doFinal(msg.getRawBuffer(), msg.getOffset(), msg.getLength());
+        long start=System.nanoTime();
+        try {
+            byte[] decrypted_msg;
+            if(cipher == null)
+                decrypted_msg=code(msg.getRawBuffer(), msg.getOffset(), msg.getLength(), true);
+            else
+                decrypted_msg=cipher.doFinal(msg.getRawBuffer(), msg.getOffset(), msg.getLength());
 
-        if(!decrypt_entire_msg) {
-            msg.setBuffer(decrypted_msg);
-            return msg;
+            if(!decrypt_entire_msg) {
+                msg.setBuffer(decrypted_msg);
+                return msg;
+            }
+
+            Message ret=Util.streamableFromBuffer(Message.class,decrypted_msg,0,decrypted_msg.length);
+            if(ret.getDest() == null)
+                ret.setDest(msg.getDest());
+            if(ret.getSrc() == null)
+                ret.setSrc(msg.getSrc());
+            return ret;
         }
-
-        Message ret=Util.streamableFromBuffer(Message.class,decrypted_msg,0,decrypted_msg.length);
-        if(ret.getDest() == null)
-            ret.setDest(msg.getDest());
-        if(ret.getSrc() == null)
-            ret.setSrc(msg.getSrc());
-        return ret;
+        finally {
+            long time=System.nanoTime() - start;
+            avg_decrypt_time.add(time / 1000);
+        }
     }
 
     private void sendSecretKey(SecretKey secret, PublicKey pubKey, Address source) throws Exception {
@@ -830,7 +867,7 @@ public class ENCRYPT extends Protocol {
     private void sendKeyRequest() {
         Message newMsg=new Message(keyServerAddr, local_addr, Kpair.getPublic().getEncoded())
           .putHeader(this.id,new EncryptHeader(EncryptHeader.KEY_REQUEST,getSymVersion()));
-        down_prot.down(new Event(Event.MSG, newMsg));
+        down_prot.down(new Event(Event.MSG,newMsg));
     }
 
     public Object down(Event evt) {
@@ -934,16 +971,19 @@ public class ENCRYPT extends Protocol {
 
 
     private byte[] code(byte[] buf, int offset, int length, boolean decode) throws Exception {
-        int index=getRandomIndex(cipher_pool_size);
+        int index=getNextIndex();
         Lock lock=decode? decoding_locks[index] : encoding_locks[index];
         Cipher cipher=decode? decoding_ciphers[index] : encoding_ciphers[index];
 
+        long start=System.nanoTime();
         lock.lock();
         try {
             return cipher.doFinal(buf, offset, length);
         }
         finally {
             lock.unlock();
+            long time=System.nanoTime() - start;
+            avg_encrypt_time.add(time /1000);
         }
     }
 
@@ -995,10 +1035,10 @@ public class ENCRYPT extends Protocol {
     }
 
 
-    protected static int getRandomIndex(int size) {
+    protected int getNextIndex() {
         // same as mod, but (apparently, I'm told) more efficient. Size needs to be a power ot 2
-        int index=(int)(Math.random() * size * 10);
-        return index & (size-1);
+        int current_index=cipher_index.getAndIncrement();
+        return current_index & (cipher_pool_size-1);
     }
 
     /**
@@ -1111,14 +1151,14 @@ public class ENCRYPT extends Protocol {
      * @return Returns a decoding cipher randomly chosen from the cipher pool
      */
     public Cipher getSymDecodingCipher() {
-        return decoding_ciphers[getRandomIndex(decoding_ciphers.length)];
+        return decoding_ciphers[getNextIndex()];
     }
 
     /**
      * @return Returns an encoding cipher randomly chosen from the cipher pool
      */
     public Cipher getSymEncodingCipher() {
-        return encoding_ciphers[getRandomIndex(encoding_ciphers.length)];
+        return encoding_ciphers[getNextIndex()];
     }
 
     /**
